@@ -16,6 +16,7 @@ from areno.api.backend.base import Backend, get_backend_cls
 from areno.api.config import BackendConfig, coerce_backend_config, resolve_backend_type
 from areno.api.context import Context
 from areno.api.data import PromptBatch, PromptItem
+from areno.api.lifecycle import EventKind, ProgressEvent, ProgressReporter, Stage
 from areno.api.metrics import MetricsRecorder
 from areno.api.models import BackendType, RolloutResult, SamplingParams, TrainSequence
 from areno.api.roles import ModelRole
@@ -38,6 +39,7 @@ class Trainer:
         backend_type: BackendType | None = None,
         custom_config: BackendConfig | None = None,
         metrics_log_dir: str | None = None,
+        progress_reporter: ProgressReporter | None = None,
     ) -> None:
         """Create a trainer without starting backend workers.
 
@@ -55,6 +57,9 @@ class Trainer:
         self._initialized = False
         self._custom_config = coerce_backend_config(self._backend_type, custom_config)
         self._metrics = MetricsRecorder(metrics_log_dir) if metrics_log_dir else None
+        # Structured lifecycle progress reporting
+        self._progress_reporter = progress_reporter
+        self._active_stage: Stage | None = None
         # Per-step wall-time bag accumulated by the rollout/train helpers
         # so `record_train_step` can flush a complete timing snapshot.
         self._metric_timings: dict[str, float] = {}
@@ -66,17 +71,28 @@ class Trainer:
     def init(self) -> None:
         """Load tokenizer, create backend context, and initialize workers."""
 
-        real_path = self._model_path
-        self._tokenizer = load_tokenizer(real_path)
-        self._ctx = Context(
-            self._world_size, real_path, self._tokenizer, self._custom_config, eos_token_ids(real_path, self._tokenizer)
-        )
-        backend_cls = get_backend_cls(self._backend_type)
-        if backend_cls is None:
-            raise ValueError(f"unsupported backend type: {self._backend_type}")
-        self._backend = backend_cls()
-        self._backend.initialize(self._ctx)
-        self._initialized = True
+        self._emit(Stage.VALIDATING, message="validating model config")
+        try:
+            real_path = self._model_path
+            self._tokenizer = load_tokenizer(real_path)
+        except Exception as exc:
+            self._fail_with_context(exc)
+            raise
+        self._emit(Stage.INITIALIZING, message="initializing backend workers")
+        try:
+            self._ctx = Context(
+                self._world_size, real_path, self._tokenizer, self._custom_config, eos_token_ids(real_path, self._tokenizer)
+            )
+            backend_cls = get_backend_cls(self._backend_type)
+            if backend_cls is None:
+                raise ValueError(f"unsupported backend type: {self._backend_type}")
+            self._backend = backend_cls()
+            self._backend.initialize(self._ctx)
+            self._initialized = True
+            self._emit(Stage.SUCCEEDED, message="initialization complete", step=0)
+        except Exception as exc:
+            self._fail_with_context(exc)
+            raise
 
     def get_tokenizer(self) -> Any:
         """Return the initialized tokenizer for prompt and completion handling."""
@@ -109,6 +125,7 @@ class Trainer:
         if self._rollout_session_depth == 0:
             self._begin_step()
             self._rollout_wall_start = time.perf_counter()
+            self._emit(Stage.RUNNING, message="rollout session started", step=self._ctx.global_step if self._ctx else None)
             self._backend.begin_rollout_session(self._ctx)
         self._rollout_session_depth += 1
 
@@ -120,6 +137,7 @@ class Trainer:
         if self._rollout_session_depth == 0:
             self._begin_step()
             self._rollout_wall_start = time.perf_counter()
+            self._emit(Stage.RUNNING, message="rollout session started (async)", step=self._ctx.global_step if self._ctx else None)
             await self._backend.begin_rollout_session_async(self._ctx)
         self._rollout_session_depth += 1
 
@@ -338,8 +356,14 @@ class Trainer:
             raise TypeError("loss_fn must be callable")
         self._begin_step()
         start = time.perf_counter()
-        result = self._backend.train(self._ctx, batch_data, loss_fn, mini_bs, gradient_accumulation_steps)
+        try:
+            result = self._backend.train(self._ctx, batch_data, loss_fn, mini_bs, gradient_accumulation_steps)
+        except Exception as exc:
+            self._fail_with_context(exc)
+            self.finish_step()
+            raise
         self._metric_timings["train"] = time.perf_counter() - start
+        step_num = self._ctx.global_step if self._ctx else None
         if isinstance(result, dict):
             if "rollout" in self._metric_timings:
                 result["step_rollout_time_s"] = self._metric_timings["rollout"]
@@ -348,11 +372,12 @@ class Trainer:
                 result["step_e2e_time_s"] = time.perf_counter() - self._step_wall_start
         if self._metrics is not None:
             self._metrics.record_train_step(
-                step=self._ctx.global_step,
+                step=step_num,
                 train_result=result,
                 train_batch=batch_data,
                 timings=self._metric_timings,
             )
+        self._emit(Stage.RUNNING, kind=EventKind.TIMELINE, step=step_num, message=f"train step {step_num} complete", **result)
         self.finish_step()
         return result
 
@@ -377,6 +402,26 @@ class Trainer:
         if self._metrics is not None:
             self._metrics.record_dashboard_state(
                 stage=stage, step=step, epoch=epoch, role=role, status=status, extra=extra
+            )
+        # Forward dashboard state as a DIAGNOSTIC progress event for structured consumption
+        if self._progress_reporter is not None:
+            extra_kwargs: dict[str, Any] = {}
+            if step is not None:
+                extra_kwargs["step"] = step
+            if epoch is not None:
+                extra_kwargs["epoch"] = int(epoch)
+            if role is not None:
+                extra_kwargs["role"] = role
+            if extra:
+                extra_kwargs.update(extra)
+            self._progress_reporter.report(
+                ProgressEvent(
+                    stage=Stage.RUNNING,
+                    kind=EventKind.DIAGNOSTIC,
+                    step=step,
+                    message=stage,
+                    extra={"status": status, "dashboard_stage": stage, **extra_kwargs},
+                )
             )
 
     def ensure_roles(self, roles: dict[str, ModelRole]) -> None:
@@ -429,7 +474,43 @@ class Trainer:
     def save_checkpoint(self, path: str) -> str:
         """Save a HuggingFace-compatible checkpoint when supported by backend."""
 
-        return self._backend.save_checkpoint(self._ctx, path)
+        self._emit(Stage.SAVING, message=f"saving checkpoint to {path}")
+        try:
+            result = self._backend.save_checkpoint(self._ctx, path)
+            self._emit(Stage.SUCCEEDED, message=f"checkpoint saved to {path}", step=self._ctx.global_step if self._ctx else None)
+            return result
+        except Exception as exc:
+            self._fail_with_context(exc)
+            raise
+
+    def _emit(self, stage: Stage, *, kind: EventKind = EventKind.TIMELINE, step: int | None = None, message: str = "", **extra: Any) -> None:
+        """Emit a structured progress event if a reporter is configured."""
+
+        if self._progress_reporter is None:
+            return
+        if self._active_stage is None:
+            self._active_stage = stage
+        if stage != Stage.FAILED and stage != Stage.SUCCEEDED:
+            self._active_stage = stage
+        self._progress_reporter.report(
+            ProgressEvent(
+                stage=stage,
+                kind=kind,
+                step=step,
+                message=message,
+                extra={"active_stage": self._active_stage.value, **extra},
+            )
+        )
+
+    def _set_stage(self, stage: Stage) -> None:
+        """Set the active stage without emitting an event (internal bookkeeping)."""
+
+        self._active_stage = stage
+
+    def _fail_with_context(self, exc: BaseException) -> None:
+        """Emit a FAILED event with context about what was active when it failed."""
+
+        self._emit(Stage.FAILED, message=f"failed: {type(exc).__name__}: {exc}", failed_at_stage=self._active_stage.value if self._active_stage else None)
 
     def close(self) -> None:
         """Release backend workers and local resources such as metric writers."""
@@ -437,6 +518,10 @@ class Trainer:
         try:
             if self._backend is not None:
                 self._backend.close()
+            self._emit(Stage.SUCCEEDED, message="trainer closed successfully")
+        except BaseException as exc:
+            self._fail_with_context(exc)
+            raise
         finally:
             self._backend = None
             self._initialized = False

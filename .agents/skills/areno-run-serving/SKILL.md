@@ -16,7 +16,8 @@ silently changing hubs.
 1. Record commit and inspect `areno env --json`, `areno check`, GPUs, model config, and adapter registration.
 2. Validate TP/world-size constraints from current model code.
 3. Start with requested cache/context, attention backend, and CUDA graph policy. Do not disable graphs merely to hide capture failures.
-4. Probe model listing and chat:
+4. For structured progress tracking, add `--progress text` (TTY/ci output) or `--progress jsonl --progress-output <path>` (for dashboard consumption) to the serve command. The `--progress disabled` default provides zero overhead.
+5. Probe model listing and chat:
 
 ```bash
 python .agents/skills/areno-run-serving/scripts/probe_server.py \

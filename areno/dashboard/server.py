@@ -28,6 +28,23 @@ from areno.cli.diagnostics import collect_env, run_checks
 from areno.dashboard.agent_context import agent_system_prompt
 from areno.dashboard.agent_files import AgentFileBrowser
 
+# Map dashboard stage strings to lifecycle Stage values for the UI
+_STAGING_MAP = {
+    "validating": "validating",
+    "initializing": "initializing",
+    "running": "running",
+    "smoking": "smoking",
+    "tuning": "tuning",
+    "saving": "saving",
+    "loading": "loading",
+    "probing": "probing",
+    "profiling": "profiling",
+    "succeeded": "succeeded",
+    "failed": "failed",
+    "created": "created",
+    "registered": "registered",
+}
+
 ROOT = Path(os.environ.get("ARENO_DASHBOARD_ROOT", Path.cwd())).resolve()
 STATIC_DIR = Path(__file__).resolve().parent / "dist"
 STATE_FILE = ROOT / ".areno-dashboard-state.json"
@@ -271,6 +288,7 @@ class DashboardState:
         if not path.exists() or not path.is_dir():
             return
         self._load_dashboard_state(job, path)
+        self._load_progress_events(job, path)
         self._load_tensorboard_scalars(job, path)
         self._load_rollout_samples(job, path)
         self._load_run_config(job, path)
@@ -284,6 +302,67 @@ class DashboardState:
                         self._add_metric(job, str(item["name"]), float(item["value"]), int(item.get("step", job.step)))
             except Exception:
                 continue
+
+    def _load_progress_events(self, job: Job, path: Path) -> None:
+        """Consume structured progress events from progress.jsonl files for real-time stage tracking.
+
+        Reads the most recently modified progress file (by modification time) so
+        that interleaved runs (different PIDs writing to different
+        ``progress.<pid>.jsonl`` files) do not corrupt the stage display.
+        """
+
+        progress_files = sorted(path.glob("progress.*.jsonl"))
+        if not progress_files:
+            return
+        # Pick the file with the latest mtime — same heuristic as the
+        # tensorboard-event glob above (sorted by st_mtime).
+        latest = max(progress_files, key=lambda p: p.stat().st_mtime)
+        try:
+            last_seen_line = int(job.perf.get("_progress_last_line", 0))
+        except (TypeError, ValueError):
+            last_seen_line = 0
+        try:
+            lines = latest.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return
+        for i, line in enumerate(lines):
+            if i <= last_seen_line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_stage = event.get("stage")
+            if not isinstance(event_stage, str):
+                continue
+            kind = event.get("kind", "TIMELINE")
+            # Only use TIMELINE kind to drive the stage display
+            if kind == "DIAGNOSTIC":
+                # DIAGNOSTIC carries dashboard_state info already consumed by _load_dashboard_state
+                continue
+            # Map stage string to dashboard stage
+            stage_key = event_stage.lower().strip()
+            mapped = _STAGING_MAP.get(stage_key)
+            if mapped:
+                job.stage = mapped
+            else:
+                job.stage = event_stage
+            event_step = event.get("step")
+            if event_step is not None:
+                try:
+                    job.step = max(job.step, int(event_step))
+                except (TypeError, ValueError):
+                    pass
+            event_status = event.get("extra", {}).get("failed_at_stage")
+            if event_status is not None and event_stage.lower() == "failed":
+                job.status = "failed"
+            elif event_stage.lower() in {"succeeded", "success"}:
+                job.status = "succeeded"
+            job.updated_at = now()
+            # Track last seen line for incremental reads
+            job.perf["_progress_last_line"] = i
 
     def _load_dashboard_state(self, job: Job, path: Path) -> None:
         state_file = dashboard_state_source(path, job_pid(job))
@@ -649,6 +728,8 @@ def build_train_command(config: dict[str, Any]) -> list[str]:
         "--metrics-log-dir": config.get("metrics_dir"),
         "--mem-frac": config.get("mem_frac"),
         "--tune-max-samples": config.get("tune_max_samples"),
+        "--progress": config.get("progress", "disabled"),
+        "--progress-output": config.get("progress_output"),
     }
     for key, value in pairs.items():
         if value not in (None, ""):
@@ -717,6 +798,12 @@ def build_serve_command(config: dict[str, Any]) -> list[str]:
     for key, value in pairs.items():
         if value not in (None, ""):
             command.extend([key, str(value)])
+    progress = config.get("progress", "disabled")
+    if progress != "disabled":
+        command.extend(["--progress", progress])
+        progress_output = config.get("progress_output")
+        if progress_output:
+            command.extend(["--progress-output", progress_output])
     if bool_like(config.get("eager_decode")):
         command.append("--eager-decode")
     if bool_like(config.get("disable_thinking")):

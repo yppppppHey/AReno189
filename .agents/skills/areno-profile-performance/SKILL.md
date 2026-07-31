@@ -31,13 +31,14 @@ python .agents/skills/areno-profile-performance/scripts/build_nsys_command.py \
 ## Workflow
 
 1. Record workload, commit, model, topology, token lengths, concurrency, GPU, and dependency versions.
-2. Find the parent AReno PID and monitor its process tree. For train jobs, attach during at least two post-warmup steps. For serve jobs, use a fixed request set and concurrency.
-3. Capture per-GPU utilization, memory, power, and target-process memory. Memory capacity, compute utilization, and throughput are separate signals.
-4. For train, list TensorBoard scalar names before selecting series. Summarize stage time, tokens/throughput, communication, optimizer, loss, and memory metrics that actually exist; do not assume fixed tags.
-5. For serve, measure TTFT and total request latency with streaming enabled while the GPU and process monitors run. Record prompt/output lengths and active concurrency.
-6. Exclude initialization, checkpoint load, compilation, and CUDA graph capture from steady-state conclusions, but report them separately when startup is the problem.
-7. Use `py-spy record -p <pid> -o /tmp/areno.svg --duration 30` for Python scheduling, data processing, serialization, blocking I/O, or compilation orchestration.
-8. Use a bounded Nsight Systems capture for GPU compute, communication, synchronization, allocator activity, or launch gaps. Read [references/profile-policy.md](references/profile-policy.md).
-9. Compare baseline and candidate with identical workloads and multiple steady-state observations, then re-run correctness validation after optimization.
+2. If the job was launched with `--progress jsonl`, read the progress JSONL file (default path: `<metrics-log-dir>/progress.jsonl`) to determine current stage and any failures before attaching profilers.
+3. Find the parent AReno PID and monitor its process tree. For train jobs, attach during at least two post-warmup steps. For serve jobs, use a fixed request set and concurrency.
+4. Capture per-GPU utilization, memory, power, and target-process memory. Memory capacity, compute utilization, and throughput are separate signals.
+5. For train, list TensorBoard scalar names before selecting series. Summarize stage time, tokens/throughput, communication, optimizer, loss, and memory metrics that actually exist; do not assume fixed tags.
+6. For serve, measure TTFT and total request latency with streaming enabled while the GPU and process monitors run. Record prompt/output lengths and active concurrency.
+7. Exclude initialization, checkpoint load, compilation, and CUDA graph capture from steady-state conclusions, but report them separately when startup is the problem.
+8. Use `py-spy record -p <pid> -o /tmp/areno.svg --duration 30` for Python scheduling, data processing, serialization, blocking I/O, or compilation orchestration.
+9. Use a bounded Nsight Systems capture for GPU compute, communication, synchronization, allocator activity, or launch gaps. Read [references/profile-policy.md](references/profile-policy.md).
+10. Compare baseline and candidate with identical workloads and multiple steady-state observations, then re-run correctness validation after optimization.
 
 Report raw workload metadata, selected window, GPU peak/average memory and utilization, process CPU/RSS, stage breakdown or TTFT/latency, bottleneck evidence, profiler overhead, and before/after metrics. A single warmup step is not a benchmark.

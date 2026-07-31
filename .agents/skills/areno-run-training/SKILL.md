@@ -36,9 +36,10 @@ Use [scripts/read_metrics.py](scripts/read_metrics.py) to inspect event keys or 
 3. Inspect both the raw schema and the normalized schema. Treat a missing rollout `prompt`/`messages` as a required-loader error, not a warning.
 4. Build the smallest command expressing the requested real workload. Preserve user-provided `max_new_tokens` and `max_context_len`, and include the verified loader with `--dataset-loader-fn`.
 5. Use smoke or tune only when useful. Smoke is capacity evidence, not task completion.
-6. Run the real job. Confirm the requested trainer step advances. For rollout, inspect one coherent sample and reward.
-7. On failure, use [references/failure-triage.md](references/failure-triage.md). Fix the first causal error.
-8. If saving is requested, verify output and reload it through the intended adapter.
+6. For structured progress tracking, add `--progress text` (TTY/ci output) or `--progress jsonl --progress-output <path>` (for dashboard consumption) to the training command. The `--progress disabled` default provides zero overhead.
+7. Run the real job. Confirm the requested trainer step advances. For rollout, inspect one coherent sample and reward.
+8. On failure, use [references/failure-triage.md](references/failure-triage.md). Fix the first causal error.
+9. If saving is requested, verify output and reload it through the intended adapter.
 
 ## Capacity invariants
 

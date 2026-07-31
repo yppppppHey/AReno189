@@ -18,6 +18,7 @@ import torch
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from areno.api.lifecycle import EventKind, ProgressEvent, ProgressReporter, Stage, create_progress_reporter
 from areno.api.openai_chat import build_chat_completion_response, messages_to_prompt_tokens
 from areno.api.tokenizer import configure_chat_template_enable_thinking
 from areno.api.tool_call_parser import ToolCallParser, get_tool_call_parser, infer_tool_call_parser_name
@@ -141,6 +142,7 @@ class ServeState:
     default_max_tokens: int
     max_model_len: int
     tool_call_parser: ToolCallParser
+    progress_reporter: ProgressReporter | None
     active_tasks: set[asyncio.Task] = field(default_factory=set)
     closing: bool = False
     rollout_session_started: bool = False
@@ -168,6 +170,7 @@ def create_app(
     eager_decode: bool = False,
     attn_backend: Literal["flash", "native"] = "flash",
     chat_template_enable_thinking: bool | None = None,
+    progress_reporter: ProgressReporter | None = None,
 ) -> FastAPI:
     """Construct the FastAPI app: load tokenizer/engine, install routes and lifecycle hooks."""
     if world_size < 1:
@@ -203,6 +206,7 @@ def create_app(
         default_max_tokens=default_max_tokens,
         max_model_len=int(engine.config.model.max_position_embeddings),
         tool_call_parser=get_tool_call_parser(infer_tool_call_parser_name(parser_trainer)),
+        progress_reporter=progress_reporter,
     )
     app = FastAPI(title="areno OpenAI-compatible server")
     app.state.areno_serve = state
@@ -211,9 +215,18 @@ def create_app(
     @app.on_event("startup")
     async def startup() -> None:
         """Open one long-lived rollout session for serving."""
+        pr = state.progress_reporter
+        if pr is not None:
+            pr.open()
+            pr.report(ProgressEvent(stage=Stage.VALIDATING, kind=EventKind.TIMELINE, message="validating serve config"))
+            pr.report(ProgressEvent(stage=Stage.INITIALIZING, kind=EventKind.TIMELINE, message="initializing serve workers"))
         try:
             await state.engine.begin_rollout_session_async()
-        except BaseException:
+            if pr is not None:
+                pr.report(ProgressEvent(stage=Stage.RUNNING, kind=EventKind.TIMELINE, message="serve ready"))
+        except BaseException as exc:
+            if pr is not None:
+                pr.report(ProgressEvent(stage=Stage.FAILED, kind=EventKind.TIMELINE, message=f"serve startup failed: {exc}", extra={"failed_at_stage": "INITIALIZING"}))
             state.engine.close()
             raise
         state.rollout_session_started = True
@@ -227,8 +240,18 @@ def create_app(
         try:
             if state.rollout_session_started:
                 await state.engine.end_rollout_session_async()
+            pr = state.progress_reporter
+            if pr is not None:
+                pr.report(ProgressEvent(stage=Stage.SUCCEEDED, kind=EventKind.TIMELINE, message="serve closed successfully"))
+        except BaseException as exc:
+            pr = state.progress_reporter
+            if pr is not None:
+                pr.report(ProgressEvent(stage=Stage.FAILED, kind=EventKind.TIMELINE, message=f"serve shutdown failed: {exc}"))
         finally:
             state.engine.close()
+            pr = state.progress_reporter
+            if pr is not None:
+                pr.close()
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -563,6 +586,18 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str]:
     is_flag=True,
     help="Pass enable_thinking=False to tokenizer chat templates when supported.",
 )
+@click.option(
+    "--progress",
+    type=click.Choice(["disabled", "text", "jsonl"]),
+    default="disabled",
+    show_default=True,
+    help="Structured progress output mode. 'text' for in-place TTY display, 'jsonl' for line-delimited JSON to --progress-output, 'disabled' for no structured output.",
+)
+@click.option(
+    "--progress-output",
+    default=None,
+    help="Output path for --progress jsonl. Required when --progress=jsonl.",
+)
 def serve_command(
     model_path: str,
     model_hub: Literal["hf", "modelscope"],
@@ -576,13 +611,19 @@ def serve_command(
     eager_decode: bool,
     attn_backend: Literal["flash", "native"],
     disable_thinking: bool,
+    progress: str = "disabled",
+    progress_output: str | None = None,
 ) -> None:
     """Click entry point: build the app and hand it to uvicorn."""
     import uvicorn
 
     model_path = resolve_model_ref(model_path, model_hub=model_hub)
+    if progress == "jsonl" and progress_output is None:
+        # For serve, default to a temp file in CWD since there's no metrics_dir
+        progress_output = ".areno-progress.jsonl"
     from areno.cli.dashboard_registry import register_dashboard_job
 
+    progress_reporter = create_progress_reporter(mode=progress, output_path=progress_output)
     register_dashboard_job(
         kind="serve",
         name=f"serve {model_path}",
@@ -610,6 +651,7 @@ def serve_command(
         eager_decode=eager_decode,
         attn_backend=attn_backend,
         chat_template_enable_thinking=False if disable_thinking else None,
+        progress_reporter=progress_reporter,
     )
     uvicorn.run(app, host=host, port=port)
 

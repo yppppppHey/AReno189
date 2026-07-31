@@ -129,7 +129,7 @@ TRAIN_OPTION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     ("Checkpoint", ("save_path", "save_interval")),
-    ("Observability", ("metrics_log_dir",)),
+    ("Observability", ("metrics_log_dir", "progress", "progress_output",)),
 )
 
 
@@ -791,7 +791,7 @@ def _trainer_config_from_args(args) -> TrainerConfig:
     )
 
 
-def run(trainer_config: TrainerConfig):
+def run(trainer_config: TrainerConfig, *, progress_mode: str = "disabled", progress_output: str | None = None):
     """Build the trainer chosen by `--algo` and run `.fit()` to completion."""
 
     # Heavy dependencies are imported lazily so `python train.py --help`
@@ -799,31 +799,38 @@ def run(trainer_config: TrainerConfig):
     from datasets import load_dataset, load_from_disk
 
     import areno.api
+    from areno.api.lifecycle import create_progress_reporter
     from areno.api.rewards import load_reward_fn
     from areno.api.trainer_factory import build_trainer
 
-    trainer_config = resolve_model_refs_for_config(trainer_config)
-    _write_dashboard_run_config(trainer_config)
-    loss_fn = _loss_fn_for_config(trainer_config)
-    reward_fn_path = _reward_fn_path_for_config(trainer_config)
-    reward_fn = load_reward_fn(reward_fn_path) if reward_fn_path else None
+    progress_reporter = create_progress_reporter(mode=progress_mode, output_path=progress_output)
+    progress_reporter.open()
+    try:
+        trainer_config = resolve_model_refs_for_config(trainer_config)
+        _write_dashboard_run_config(trainer_config)
+        loss_fn = _loss_fn_for_config(trainer_config)
+        reward_fn_path = _reward_fn_path_for_config(trainer_config)
+        reward_fn = load_reward_fn(reward_fn_path) if reward_fn_path else None
 
-    api_trainer = areno.api.Trainer(
-        trainer_config.world_size,
-        trainer_config.ckpt,
-        backend_type=areno.api.Areno,
-        metrics_log_dir=trainer_config.metrics_log_dir,
-        custom_config=trainer_config.areno_config(),
-    )
-    dataset = _load_dataset_for_training(
-        trainer_config.dataset_path,
-        dataset_loader_fn=trainer_config.dataset_loader_fn,
-        model_hub=trainer_config.model_hub,
-        load_dataset=load_dataset,
-        load_from_disk=load_from_disk,
-    )
-    trainer = build_trainer(trainer_config, instance=api_trainer, dataset=dataset, reward_fn=reward_fn, loss_fn=loss_fn)
-    trainer.fit()
+        api_trainer = areno.api.Trainer(
+            trainer_config.world_size,
+            trainer_config.ckpt,
+            backend_type=areno.api.Areno,
+            metrics_log_dir=trainer_config.metrics_log_dir,
+            custom_config=trainer_config.areno_config(),
+            progress_reporter=progress_reporter,
+        )
+        dataset = _load_dataset_for_training(
+            trainer_config.dataset_path,
+            dataset_loader_fn=trainer_config.dataset_loader_fn,
+            model_hub=trainer_config.model_hub,
+            load_dataset=load_dataset,
+            load_from_disk=load_from_disk,
+        )
+        trainer = build_trainer(trainer_config, instance=api_trainer, dataset=dataset, reward_fn=reward_fn, loss_fn=loss_fn)
+        trainer.fit()
+    finally:
+        progress_reporter.close()
 
 
 def _write_dashboard_run_config(config: TrainerConfig) -> None:
@@ -1301,6 +1308,18 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
 )
 @click.option("--train-tool-results", is_flag=True, help="Include tool-result spans in agentic policy loss.")
 @click.option(
+    "--progress",
+    type=click.Choice(["disabled", "text", "jsonl"]),
+    default="disabled",
+    show_default=True,
+    help="Structured progress output mode. 'text' for in-place TTY display, 'jsonl' for line-delimited JSON to --progress-output, 'disabled' for no structured output.",
+)
+@click.option(
+    "--progress-output",
+    default=None,
+    help="Output path for --progress jsonl. Required when --progress=jsonl.",
+)
+@click.option(
     "--gspo-clip-eps", type=float, default=3.0e-4, show_default=True, help="GSPO sequence-ratio clipping epsilon."
 )
 @click.option("--grpo-clip-eps", type=float, default=0.2, show_default=True, help="GRPO token-ratio clipping epsilon.")
@@ -1329,6 +1348,11 @@ def train_command(**options) -> None:
 
     trainer_config = _trainer_config_from_options(**options)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    progress_mode = options.get("progress", "disabled")
+    progress_output = options.get("progress_output")
+    if progress_mode == "jsonl" and progress_output is None:
+        # Default JSONL output to metrics_log_dir for dashboard consumption
+        progress_output = str(Path(options.get("metrics_log_dir", "")) / "progress.jsonl")
     if options.get("smoke_infer") or options.get("smoke_train"):
         from areno.cli.auto_tune import smoke_infer_config, smoke_train_config
 
@@ -1363,7 +1387,7 @@ def train_command(**options) -> None:
         config=_training_config_settings(trainer_config),
         metrics_dir=trainer_config.metrics_log_dir,
     )
-    run(trainer_config)
+    run(trainer_config, progress_mode=progress_mode, progress_output=progress_output)
 
 
 def main() -> None:
